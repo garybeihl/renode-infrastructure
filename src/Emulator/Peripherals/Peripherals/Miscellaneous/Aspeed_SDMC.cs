@@ -5,6 +5,7 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 
+using System;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
@@ -13,135 +14,166 @@ using Antmicro.Renode.Peripherals.Bus;
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     // Aspeed AST2600 SDRAM Memory Controller (SDMC)
-    // Reference: QEMU hw/misc/aspeed_sdmc.c
+    // Reference: QEMU hw/misc/aspeed_sdmc.c, u-boot drivers/ram/aspeed/sdram_ast2600.c
     //
-    // Reports memory configuration so u-boot SPL can determine DRAM size.
-    // For 1 GiB: config register encodes size index 2 (256M=0, 512M=1, 1024M=2, 2048M=3).
+    // Large R/W register file matching QEMU behavior. Any offset can be written/read.
+    // Special handling for protection key, config, status, and ECC test registers.
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
     public sealed class Aspeed_SDMC : BasicDoubleWordPeripheral, IKnownSize
     {
         public Aspeed_SDMC(IMachine machine) : base(machine)
         {
             DefineRegisters();
+            Reset();
         }
 
-        public long Size => 0x1000;
+        public long Size => RegisterSpaceSize;
 
         public override void Reset()
         {
             base.Reset();
-            // PHY status: set phy ok (bit 1), PVT cal ok (bit 3 clear)
-            RegistersCollection.Write(0x400, 0x00000002);
-            // PHY eye window: all passing
-            RegistersCollection.Write(0x400 + 0x50, 0x0FFFFFFF);
-            RegistersCollection.Write(0x400 + 0x68, 0x000000FF);
-            RegistersCollection.Write(0x400 + 0x7C, 0x000000FF);
+            Array.Clear(storage, 0, storage.Length);
+
+            // Protection key: locked on reset
+            storage[0x00 / 4] = ProtSoftlocked;
+
+            // Config: default hardware config
+            storage[0x04 / 4] = DefaultConfig;
+
+            // Status1: PHY PLL locked, not busy
+            storage[0x60 / 4] = PhyPllLockStatus;
+
+            // PHY status registers at 0x400+
+            storage[0x400 / 4] = 0x00000002; // PHY init done
+            storage[0x430 / 4] = 0x00000001; // PHY DLL locked
+            storage[0x450 / 4] = 0x0FFFFFFF; // eye window 1
+            storage[0x468 / 4] = 0x000000FF; // eye window 2
+            storage[0x47C / 4] = 0x000000FF; // eye window 3
+            storage[0x488 / 4] = 0x000000FF; // eye window pass
+            storage[0x490 / 4] = 0x000000FF; // eye window pass
+            storage[0x4C8 / 4] = 0x000000FF; // eye window pass
+        }
+
+        public override uint ReadDoubleWord(long offset)
+        {
+            if(offset >= 0 && offset < RegisterSpaceSize)
+            {
+                return storage[(uint)offset / 4];
+            }
+            this.Log(LogLevel.Warning, "Read from offset 0x{0:X} beyond register space", offset);
+            return 0;
+        }
+
+        public override void WriteDoubleWord(long offset, uint value)
+        {
+            if(offset < 0 || offset >= RegisterSpaceSize)
+            {
+                this.Log(LogLevel.Warning, "Write to offset 0x{0:X} beyond register space", offset);
+                return;
+            }
+
+            var reg = (uint)offset / 4;
+
+            switch((uint)offset)
+            {
+                case 0x00: // Protection key — transform like QEMU
+                    if(value == ProtKeyUnlock)
+                    {
+                        storage[reg] = ProtUnlocked;
+                        this.Log(LogLevel.Debug, "SDMC unlocked");
+                    }
+                    else if(value == ProtKeyHardlock)
+                    {
+                        storage[reg] = ProtHardlocked;
+                        this.Log(LogLevel.Debug, "SDMC hardlocked");
+                    }
+                    else
+                    {
+                        storage[reg] = ProtSoftlocked;
+                        this.Log(LogLevel.Debug, "SDMC softlocked");
+                    }
+                    return;
+
+                case 0x04: // Config — preserve readonly bits
+                    value = ComputeConfig(value);
+                    break;
+
+                case 0x60: // Status1 — clear busy, always set PLL lock
+                    value &= ~PhyBusyState;
+                    value |= PhyPllLockStatus;
+                    break;
+
+                case 0x70: // ECC test control — always done, never fail
+                    value |= EccTestFinished;
+                    value &= ~EccTestFail;
+                    break;
+
+                default:
+                    if(!IsExemptFromProtection((uint)offset) && !IsUnlocked)
+                    {
+                        return;
+                    }
+                    break;
+            }
+
+            storage[reg] = value;
+        }
+
+        private uint ComputeConfig(uint data)
+        {
+            data &= ~ReadonlyConfigMask;
+            return data | FixedConfig;
+        }
+
+        private bool IsUnlocked => storage[0x00 / 4] == ProtUnlocked;
+
+        private bool IsExemptFromProtection(uint offset)
+        {
+            switch(offset)
+            {
+                case 0x00:  // R_PROT
+                case 0x04:  // R_CONF (special handling)
+                case 0x50:  // R_ISR
+                case 0x60:  // R_STATUS1 (special handling)
+                case 0x6C:  // R_MCR6C
+                case 0x70:  // R_ECC_TEST_CTRL (special handling)
+                case 0x74:  // R_TEST_START_LEN
+                case 0x78:  // R_TEST_FAIL_DQ
+                case 0x7C:  // R_TEST_INIT_VAL
+                case 0x88:  // R_DRAM_SW
+                case 0x8C:  // R_DRAM_TIME
+                case 0xB4:  // R_ECC_ERR_INJECT
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         private void DefineRegisters()
         {
-            // MCR00 — Protection Key
-            Registers.ProtectionKey.Define(this, 0x0)
-                .WithValueField(0, 32, out protectionKey, name: "PROT_KEY",
-                    writeCallback: (_, value) =>
-                    {
-                        if(value == ProtectionKeyUnlock)
-                        {
-                            this.Log(LogLevel.Debug, "SDMC unlocked");
-                        }
-                    });
-
-            // MCR04 — Configuration (HW_VERSION, VGA_APERTURE, DRAM_SIZE are readonly)
-            Registers.Configuration.Define(this, DefaultConfig)
-                .WithValueField(0, 2, FieldMode.Read, name: "DRAM_SIZE")
-                .WithValueField(2, 2, FieldMode.Read, name: "VGA_APERTURE")
-                .WithValueField(4, 1, name: "DRAM_TYPE")
-                .WithReservedBits(5, 5)
-                .WithFlag(10, name: "CACHE_ENABLE")
-                .WithFlag(11, name: "CACHE_RANGE_CTRL")
-                .WithFlag(12, name: "CACHE_INITIAL")
-                .WithFlag(13, name: "CACHE_DDR4_CONF")
-                .WithReservedBits(14, 5)
-                .WithFlag(19, FieldMode.Read, name: "CACHE_INITIAL_DONE")
-                .WithReservedBits(20, 8)
-                .WithValueField(28, 4, FieldMode.Read, name: "HW_VERSION");
-
-            // MCR50 — Interrupt Status
-            Registers.InterruptStatus.Define(this, 0x0)
-                .WithValueField(0, 32, name: "ISR");
-
-            // MCR60 — Status 1 (PHY status: PLL lock always set)
-            Registers.Status1.Define(this, PhyPllLockStatus)
-                .WithFlag(0, FieldMode.Read, name: "PHY_BUSY")
-                .WithReservedBits(1, 3)
-                .WithFlag(4, FieldMode.Read, name: "PHY_PLL_LOCK")
-                .WithReservedBits(5, 27);
-
-            // MCR6C — reserved (writable)
-            Registers.Reserved6C.Define(this, 0x0)
-                .WithValueField(0, 32, name: "MCR6C");
-
-            // MCR70 — ECC Test Control (always done, always pass)
-            Registers.ECCTestControl.Define(this, 0x0)
-                .WithValueField(0, 32, name: "ECC_TEST_CTRL");
-
-            Registers.TestStartLength.Define(this, 0x0)
-                .WithValueField(0, 32, name: "TEST_START_LEN");
-            Registers.TestFailDQ.Define(this, 0x0)
-                .WithValueField(0, 32, name: "TEST_FAIL_DQ");
-            Registers.TestInitValue.Define(this, 0x0)
-                .WithValueField(0, 32, name: "TEST_INIT_VAL");
-            Registers.DramSW.Define(this, 0x0)
-                .WithValueField(0, 32, name: "DRAM_SW");
-            Registers.DramTime.Define(this, 0x0)
-                .WithValueField(0, 32, name: "DRAM_TIME");
-            Registers.ECCErrorInject.Define(this, 0x0)
-                .WithValueField(0, 32, name: "ECC_ERR_INJECT");
-
-            // PHY registers at 0x400+
-            Registers.PhyStatus.Define(this, 0x00000002)
-                .WithValueField(0, 32, name: "PHY_STATUS");
-            Registers.PhyEyeWindow1.Define(this, 0x0FFFFFFF)
-                .WithValueField(0, 32, name: "PHY_EYE1");
-            Registers.PhyEyeWindow2.Define(this, 0x000000FF)
-                .WithValueField(0, 32, name: "PHY_EYE2");
-            Registers.PhyEyeWindow3.Define(this, 0x000000FF)
-                .WithValueField(0, 32, name: "PHY_EYE3");
+            // No framework registers — everything goes through storage array
+            // via ReadDoubleWord/WriteDoubleWord overrides
         }
 
-        private bool IsUnlocked => protectionKey.Value == ProtectionKeyUnlock;
+        private readonly uint[] storage = new uint[RegisterSpaceSize / 4];
 
-        private IValueRegisterField protectionKey;
+        // Protection key constants (per QEMU)
+        private const uint ProtKeyUnlock   = 0xFC600309;
+        private const uint ProtKeyHardlock = 0xDEADDEAD;
+        private const uint ProtUnlocked    = 0x01;
+        private const uint ProtHardlocked  = 0x10;
+        private const uint ProtSoftlocked  = 0x00;
 
-        private const uint ProtectionKeyUnlock = 0xFC600309;
-
-        // AST2600 1GiB config:
-        //   HW_VERSION = 3 (bits 31:28)
-        //   VGA_APERTURE = 64MB = 3 (bits 3:2)
-        //   DRAM_SIZE = 1GiB = index 2 (bits 1:0)
+        // AST2600 1GiB: HW_VERSION=3, VGA=64MB(3), DRAM=1GiB(2)
         private const uint DefaultConfig = (3u << 28) | (3u << 2) | 2u;
+        private const uint FixedConfig = DefaultConfig;
+        private const uint ReadonlyConfigMask = 0xF000000F;
 
-        // PHY PLL lock status (bit 4)
-        private const uint PhyPllLockStatus = (1u << 4);
+        private const uint PhyBusyState     = 1u << 0;
+        private const uint PhyPllLockStatus = 1u << 4;
+        private const uint EccTestFinished  = 1u << 12;
+        private const uint EccTestFail      = 1u << 13;
 
-        private enum Registers
-        {
-            ProtectionKey    = 0x000,
-            Configuration    = 0x004,
-            InterruptStatus  = 0x050,
-            Status1          = 0x060,
-            Reserved6C       = 0x06C,
-            ECCTestControl   = 0x070,
-            TestStartLength  = 0x074,
-            TestFailDQ       = 0x078,
-            TestInitValue    = 0x07C,
-            DramSW           = 0x088,
-            DramTime         = 0x08C,
-            ECCErrorInject   = 0x0B4,
-            PhyStatus        = 0x400,
-            PhyEyeWindow1    = 0x450,
-            PhyEyeWindow2    = 0x468,
-            PhyEyeWindow3    = 0x47C,
-        }
+        private const int RegisterSpaceSize = 0x1000;
     }
 }
