@@ -1,8 +1,6 @@
 //
-// Copyright (c) 2026 Gary Beihl
-//
-// This file is licensed under the MIT License.
-// Full license text is available in 'licenses/MIT.txt'.
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
 //
 
 using Antmicro.Renode.Core;
