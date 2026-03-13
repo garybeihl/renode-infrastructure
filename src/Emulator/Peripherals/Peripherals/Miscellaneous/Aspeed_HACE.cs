@@ -167,31 +167,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private byte[] ExecuteAccumulation(HashAlgorithmName algo, byte[] data, bool sgMode)
         {
-            // In accumulation mode, we need to detect if this is the final
-            // request by checking for padding in the data (0x80 followed by
-            // message length in last 8 bytes).
+            // In accumulation mode, detect the final request by checking for
+            // SHA padding (0x80 byte followed by zeros and 8-byte big-endian
+            // bit length). QEMU checks padding in both SG and direct modes.
             bool isFinal = false;
             int dataLen = data.Length;
-
-            if(sgMode && dataLen >= 9)
-            {
-                // Check for SHA padding: last bytes contain bit-length
-                ulong bitLen = 0;
-                for(int i = dataLen - 8; i < dataLen; i++)
-                {
-                    bitLen = (bitLen << 8) | data[i];
-                }
-                ulong totalMsgLen = bitLen / 8;
-                if(totalMsgLen <= (ulong)totalReqLen + (ulong)dataLen)
-                {
-                    int padSize = (int)((ulong)totalReqLen + (ulong)dataLen - totalMsgLen);
-                    if(padSize > 0 && padSize < dataLen && data[dataLen - padSize] == 0x80)
-                    {
-                        isFinal = true;
-                        dataLen -= padSize;
-                    }
-                }
-            }
 
             if(accumulationCtx == null)
             {
@@ -199,8 +179,34 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 totalReqLen = 0;
             }
 
-            accumulationCtx.AppendData(data, 0, dataLen);
+            // Update total_req_len BEFORE padding check (matches QEMU behavior)
             totalReqLen += dataLen;
+
+            if(dataLen >= 9)
+            {
+                // Read 8-byte big-endian bit-length from end of data
+                ulong bitLen = 0;
+                for(int i = dataLen - 8; i < dataLen; i++)
+                {
+                    bitLen = (bitLen << 8) | data[i];
+                }
+                ulong totalMsgLen = bitLen / 8;
+                if(totalMsgLen <= (ulong)totalReqLen)
+                {
+                    uint paddingSize = (uint)((ulong)totalReqLen - totalMsgLen);
+                    if(paddingSize > 0 && paddingSize <= (uint)dataLen)
+                    {
+                        int padOffset = dataLen - (int)paddingSize;
+                        if(data[padOffset] == 0x80)
+                        {
+                            isFinal = true;
+                            dataLen = padOffset;
+                        }
+                    }
+                }
+            }
+
+            accumulationCtx.AppendData(data, 0, dataLen);
 
             if(isFinal)
             {
@@ -357,15 +363,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const uint SgEnBit      = 1u << 18;
 
         // AST2600 masks
-        private const uint SrcMask     = 0x7FFFFFFF;
-        private const uint DestMask    = 0x7FFFFFF8;
-        private const uint KeyMask     = 0x7FFFFFF8;
+        private const uint SrcMask     = 0xFFFFFFFF;
+        private const uint DestMask    = 0xFFFFFFF8;
+        private const uint KeyMask     = 0xFFFFFFF8;
         private const uint LenMask     = 0x0FFFFFFF;
         private const uint HashCmdMask = 0x00147FFF;
 
         // SG list parsing
         private const uint SgListLenMask  = 0x0FFFFFFF;
-        private const uint SgListAddrMask = 0x7FFFFFFF;
+        private const uint SgListAddrMask = 0xFFFFFFFF;
         private const uint SgListLastBit  = 0x80000000;
     }
 }
