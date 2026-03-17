@@ -185,6 +185,18 @@ void renode_set_host_blocks(host_memory_block_packed_t *blocks, int count)
 
   lists = new_mappings;
   free_list(&old_mappings);
+
+  /* DEBUG: log registered host blocks */
+  tlib_printf(LOG_LEVEL_WARNING, "renode_set_host_blocks: %d blocks registered", count);
+  for(i = 0; i < count && i < 10; i++) {
+      tlib_printf(LOG_LEVEL_WARNING, "  block[%d]: start=0x%lx size=0x%lx host=%p",
+          i, (unsigned long)new_mappings->elements[i].start,
+          (unsigned long)new_mappings->elements[i].size,
+          new_mappings->elements[i].host_pointer);
+  }
+  if(count > 10) {
+      tlib_printf(LOG_LEVEL_WARNING, "  ... and %d more blocks", count - 10);
+  }
 }
 
 EXC_VOID_2(renode_set_host_blocks, host_memory_block_packed_t *, blocks, int, count)
