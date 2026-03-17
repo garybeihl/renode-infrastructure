@@ -86,6 +86,11 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             Registers.ClockStopCtrl2Clear.Define(this)
                 .WithValueField(0, 32, FieldMode.Write, name: "CLK_STOP_CTRL2_CLR");
 
+            // SCU0C0 - Misc Control (Linux clk-ast2600 reads bit 12 for UART_DIV13_EN)
+            // Reset value 0: UART clock = 24 MHz (matches QEMU)
+            Registers.MiscCtrl.Define(this, 0x0)
+                .WithValueField(0, 32, name: "MISC_CTRL");
+
             // SCU0C8 - Debug Control
             Registers.DebugCtrl.Define(this, 0x00000FFF)
                 .WithValueField(0, 32, name: "DEBUG_CTRL");
@@ -300,6 +305,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             ClockStopCtrlClear    = 0x084,
             ClockStopCtrl2        = 0x090,
             ClockStopCtrl2Clear   = 0x094,
+            MiscCtrl              = 0x0C0,
             DebugCtrl             = 0x0C8,
             DebugCtrl2            = 0x0D8,
             SdramHandshake        = 0x100,
