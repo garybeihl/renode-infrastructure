@@ -1,4 +1,4 @@
-// Copyright (c) Microsoft Corporation.
+// Copyright (c) 2026 Microsoft
 // Licensed under the MIT license.
 //
 // Aspeed AST2600 LPC Controller with 4 KCS channels
