@@ -10,18 +10,26 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.Memory;
 
 namespace Antmicro.Renode.Peripherals.SPI
 {
     // Aspeed AST2600 Firmware Memory Controller (FMC)
     // Reference: QEMU hw/ssi/aspeed_smc.c (ast2600 FMC variant)
     //
-    // The FMC provides SPI flash access through two mechanisms:
-    //   1. Memory-mapped window at 0x20000000 (handled by separate MappedMemory)
-    //   2. DMA engine for bulk flash<->DRAM transfers with checksum
+    // The FMC provides SPI flash access through two bus regions:
+    //   1. "registers" at 0x1E620000 — control/status/DMA registers
+    //   2. "flash" at 0x20000000 — memory-mapped flash window
+    //
+    // The flash window supports two modes controlled by CE0 Control Register:
+    //   - Normal mode (type=0): reads/writes go to backing MappedMemory
+    //   - User mode (type=3): reads/writes send SPI bytes to GenericSpiFlash
+    //
+    // User mode is used by the Linux spi-aspeed-smc driver to send JEDEC
+    // Read ID (0x9F) and other SPI commands to identify the flash chip.
     //
     // The DMA engine reads/writes through the system bus so it can access
-    // both the flash window (MappedMemory at 0x20000000) and DRAM (at 0x80000000).
+    // both the flash window (at 0x20000000) and DRAM (at 0x80000000).
     //
     // AST2600-specific features:
     //   - DMA grant handshake (0xAEED0000 request / 0xDEEA0000 clear)
@@ -34,18 +42,26 @@ namespace Antmicro.Renode.Peripherals.SPI
     [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
     public sealed class Aspeed_FMC : BasicDoubleWordPeripheral, IKnownSize, INumberedGPIOOutput
     {
-        public Aspeed_FMC(IMachine machine) : base(machine)
+        public Aspeed_FMC(IMachine machine, MappedMemory flashMemory) : base(machine)
         {
             sysbus = machine.GetSystemBus(this);
-            var dict = new System.Collections.Generic.Dictionary<int, IGPIO>();
+            this.flashMemory = flashMemory;
+            this.spiFlash = new GenericSpiFlash(flashMemory,
+                manufacturerId: 0xEF, memoryType: 0x40, capacityCode: 0x20);
+
+            var dict = new Dictionary<int, IGPIO>();
             dict[0] = new GPIO();  // DMA completion IRQ
-            Connections = new System.Collections.ObjectModel.ReadOnlyDictionary<int, IGPIO>(dict);
+            Connections = new ReadOnlyDictionary<int, IGPIO>(dict);
 
             dmaCtrl = 0;
             dmaFlashAddr = 0;
             dmaDramAddr = 0;
             dmaLen = 0;
             dmaChecksum = 0;
+
+            // CE0 defaults: normal mode (type=0), CE_STOP_ACTIVE
+            ceType = DefaultCECtrl & 0x3;
+            ceStopActive = (DefaultCECtrl & 0x4) != 0;
 
             DefineRegisters();
         }
@@ -57,12 +73,107 @@ namespace Antmicro.Renode.Peripherals.SPI
         public override void Reset()
         {
             base.Reset();
+            spiFlash.Reset();
             dmaCtrl = 0;
             dmaFlashAddr = 0;
             dmaDramAddr = 0;
             dmaLen = 0;
             dmaChecksum = 0;
+            ceType = DefaultCECtrl & 0x3;
+            ceStopActive = (DefaultCECtrl & 0x4) != 0;
             Connections[0].Unset();
+        }
+
+        // --- Register region (0x1E620000) ---
+
+        [ConnectionRegion("registers")]
+        public override uint ReadDoubleWord(long offset)
+        {
+            return RegistersCollection.Read(offset);
+        }
+
+        [ConnectionRegion("registers")]
+        public override void WriteDoubleWord(long offset, uint value)
+        {
+            RegistersCollection.Write(offset, value);
+        }
+
+        // --- Flash region (0x20000000) ---
+
+        [ConnectionRegion("flash")]
+        public byte FlashReadByte(long offset)
+        {
+            if(IsUserMode())
+            {
+                return spiFlash.Transmit(0);
+            }
+            return flashMemory.ReadByte(offset);
+        }
+
+        [ConnectionRegion("flash")]
+        public void FlashWriteByte(long offset, byte value)
+        {
+            if(IsUserMode())
+            {
+                spiFlash.Transmit(value);
+            }
+            else
+            {
+                flashMemory.WriteByte(offset, value);
+            }
+        }
+
+        [ConnectionRegion("flash")]
+        public uint FlashReadDoubleWord(long offset)
+        {
+            if(IsUserMode())
+            {
+                uint result = 0;
+                for(int i = 0; i < 4; i++)
+                {
+                    result |= (uint)spiFlash.Transmit(0) << (i * 8);
+                }
+                return result;
+            }
+            return flashMemory.ReadDoubleWord(offset);
+        }
+
+        [ConnectionRegion("flash")]
+        public void FlashWriteDoubleWord(long offset, uint value)
+        {
+            if(IsUserMode())
+            {
+                for(int i = 0; i < 4; i++)
+                {
+                    spiFlash.Transmit((byte)(value >> (i * 8)));
+                }
+            }
+            else
+            {
+                flashMemory.WriteDoubleWord(offset, value);
+            }
+        }
+
+        // --- CE0 mode tracking ---
+
+        private void UpdateCEMode(uint value)
+        {
+            var newType = value & 0x3;
+            var stopActive = (value & 0x4) != 0;
+
+            if(!ceStopActive && stopActive)
+            {
+                // CE deasserted — end SPI transaction
+                spiFlash.FinishTransmission();
+            }
+
+            ceType = newType;
+            ceStopActive = stopActive;
+        }
+
+        private bool IsUserMode()
+        {
+            return ceType == UserModeType && !ceStopActive;
         }
 
         private void DefineRegisters()
@@ -91,7 +202,8 @@ namespace Antmicro.Renode.Peripherals.SPI
 
             // 0x10-0x20 — CE0-CE2 Control Registers
             Registers.CE0Control.Define(this, DefaultCECtrl)
-                .WithValueField(0, 32, name: "CE0_CTRL");
+                .WithValueField(0, 32, name: "CE0_CTRL",
+                    writeCallback: (_, value) => UpdateCEMode((uint)value));
             Registers.CE1Control.Define(this, DefaultCECtrl)
                 .WithValueField(0, 32, name: "CE1_CTRL");
             Registers.CE2Control.Define(this, DefaultCECtrl)
@@ -423,6 +535,8 @@ namespace Antmicro.Renode.Peripherals.SPI
         // --- Fields ---
 
         private new readonly IBusController sysbus;
+        private readonly MappedMemory flashMemory;
+        private readonly GenericSpiFlash spiFlash;
 
         private uint dmaCtrl;
         private uint dmaFlashAddr;
@@ -431,6 +545,8 @@ namespace Antmicro.Renode.Peripherals.SPI
         private uint dmaChecksum;
         private uint timingsReg;
         private uint intrCtrlValue;
+        private uint ceType;
+        private bool ceStopActive;
 
         // --- Constants ---
 
@@ -442,6 +558,9 @@ namespace Antmicro.Renode.Peripherals.SPI
         private const uint DefaultSeg0 = (0x08u << 24) | (0x00u << 16);
         // Segment 1: 128-256MB
         private const uint DefaultSeg1 = (0x10u << 24) | (0x08u << 16);
+
+        // User mode type value
+        private const uint UserModeType = 3;
 
         // DMA control bits
         private const uint DmaCtrlRequest = (1u << 31);
