@@ -456,6 +456,11 @@ namespace Antmicro.Renode.Peripherals.Network
                 if(phyReg < 32)
                 {
                     readData = phyRegs[phyReg];
+                    // Ensure link status is always reported as up when PHY is read
+                    if(phyReg == MII_BMSR)
+                    {
+                        readData |= BMSR_LINK_ST;
+                    }
                 }
                 phydata = (readData << 16) | (phydata & 0xFFFF);
                 phycr &= ~PHYCR_MIIRD;

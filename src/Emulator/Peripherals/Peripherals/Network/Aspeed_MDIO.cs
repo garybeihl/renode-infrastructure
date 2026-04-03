@@ -27,6 +27,7 @@ namespace Antmicro.Renode.Peripherals.Network
         {
             ctrl = 0;
             data = 0;
+            currentPage = 0;
 
             Array.Clear(phyRegs, 0, phyRegs.Length);
             phyRegs[MII_BMCR] = 0x1000;
@@ -83,6 +84,25 @@ namespace Antmicro.Renode.Peripherals.Network
                 if(regAddr < 32)
                 {
                     readData = phyRegs[regAddr];
+                    // BMCR: reset bit and auto-negotiation restart are self-clearing
+                    if(regAddr == MII_BMCR)
+                    {
+                        readData &= ~(BMCR_RESET | BMCR_ANRESTART);
+                    }
+                    // Always report link up and auto-negotiation complete
+                    if(regAddr == MII_BMSR)
+                    {
+                        readData |= BMSR_LINK_ST | BMSR_ANEG_COMPLETE;
+                    }
+                    // RTL8211F: when page 0xa43 is selected, register 0x12
+                    // is PHY-Specific Status (speed/duplex/link)
+                    if(regAddr == RTL_PHYSR_REG && currentPage == RTL_PHYSR_PAGE)
+                    {
+                        // RTL8211F PHY-Specific Status Register (PHYSR)
+                        // Bit 2 = link up, Bit 3 = full duplex
+                        // Bits [5:4] = speed: 00=10M, 01=100M, 10=1000M
+                        readData = 0x2C; // 0b00101100 = 1000Mbps, full-duplex, link up
+                    }
                 }
                 data = (data & 0xFFFF0000) | (readData & 0xFFFF);
             }
@@ -91,14 +111,20 @@ namespace Antmicro.Renode.Peripherals.Network
                 var writeData = value & 0xFFFF;
                 if(regAddr < 32)
                 {
+                    // Track page selection (RTL8211F uses register 0x1f)
+                    if(regAddr == RTL_PAGE_SELECT)
+                    {
+                        currentPage = writeData;
+                    }
                     phyRegs[regAddr] = writeData;
-                    phyRegs[MII_BMSR] |= BMSR_LINK_ST;
+                    phyRegs[MII_BMSR] |= BMSR_LINK_ST | BMSR_ANEG_COMPLETE;
                 }
             }
         }
 
         private uint ctrl;
         private uint data;
+        private uint currentPage;
         private readonly uint[] phyRegs;
 
         private const long REG_CTRL = 0x0;
@@ -118,5 +144,11 @@ namespace Antmicro.Renode.Peripherals.Network
         private const int MII_1000BTCR = 9;
         private const int MII_1000BTSR = 10;
         private const uint BMSR_LINK_ST = 1u << 2;
+        private const uint BMSR_ANEG_COMPLETE = 1u << 5;
+        private const uint BMCR_RESET = 1u << 15;
+        private const uint BMCR_ANRESTART = 1u << 9;
+        private const int RTL_PAGE_SELECT = 0x1f;
+        private const int RTL_PHYSR_REG = 0x12;
+        private const uint RTL_PHYSR_PAGE = 0xa43;
     }
 }
