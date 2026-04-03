@@ -12,6 +12,7 @@ using Antmicro.Renode.Exceptions;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.IRQControllers;
 using Antmicro.Renode.Peripherals.Timers;
+using Antmicro.Renode.Utilities.Binding;
 
 using Endianess = ELFSharp.ELF.Endianess;
 
@@ -54,6 +55,14 @@ namespace Antmicro.Renode.Peripherals.CPU
         public override string GetLLVMTriple(uint flags) => flags == 1 ? AllLLVMTriples[1] : AllLLVMTriples[0];
 
         public override MemorySystemArchitectureType MemorySystemArchitecture => MemorySystemArchitectureType.Virtual_VMSA;
+
+        public bool FpuEnabled
+        {
+            set
+            {
+                tlibToggleFpu(value ? 1 : 0);
+            }
+        }
 
         // Currently unsupported
         public bool FIQMaskOverride => false;
@@ -131,5 +140,10 @@ namespace Antmicro.Renode.Peripherals.CPU
         protected ARM_GenericTimer genericTimer;
 
         private const uint GenericTimerCoprocessorRegister = 14;
+
+#pragma warning disable 649
+        [Import]
+        private readonly Action<int> tlibToggleFpu;
+#pragma warning restore 649
     }
 }
