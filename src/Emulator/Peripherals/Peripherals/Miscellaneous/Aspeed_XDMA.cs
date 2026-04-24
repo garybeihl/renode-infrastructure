@@ -150,6 +150,20 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     break;
                 }
 
+                if((srcAddr & 0x7) != 0)
+                {
+                    this.Log(LogLevel.Warning, "XDMA: Misaligned source address 0x{0:X8} at 0x{1:X8}", srcAddr, descAddr);
+                    error = true;
+                    break;
+                }
+
+                if((dstAddr & 0x7) != 0)
+                {
+                    this.Log(LogLevel.Warning, "XDMA: Misaligned destination address 0x{0:X8} at 0x{1:X8}", dstAddr, descAddr);
+                    error = true;
+                    break;
+                }
+
                 // Execute DMA transfer via sysbus
                 try
                 {
@@ -231,3 +245,4 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const int RegisterSpaceSize = 0x1000;
     }
 }
+

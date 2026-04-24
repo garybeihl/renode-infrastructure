@@ -3,8 +3,12 @@
 //
 // Aspeed AST2600 LPC Controller with 4 KCS channels
 // Ported from QEMU hw/misc/aspeed_lpc.c
+//
+// Enhanced with IPMI override table and host-side injection
+// for Birchstream co-simulation support.
 
 using System;
+using System.Collections.Generic;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
@@ -19,6 +23,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         {
             registers = new uint[RegisterSpaceSize / 4];
             IRQ = new GPIO();
+            ipmiOverrides = new Dictionary<ushort, byte[]>();
             Reset();
         }
 
@@ -154,6 +159,160 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Configurable HICR7 (chip ID) — survives reset
         public uint Hicr7ResetValue { get; set; } = 0;
 
+        // --- XDMA Boot Metadata Properties ---
+
+        public uint XdmaBaseAddress { get; set; } = 0x80001000;
+
+        public uint XdmaTransferSize { get; set; } = 0x200000;
+
+        // --- IPMI Override Table ---
+
+        /// <summary>
+        /// Configures an auto-response for a given IPMI (netFn, cmd) pair.
+        /// When a host IPMI command matching this pair is injected, the override
+        /// response is immediately written to the ODR with completion code 0x00.
+        /// </summary>
+        public void SetIpmiOverride(byte netFn, byte cmd, byte[] responseData)
+        {
+            ushort key = MakeOverrideKey(netFn, cmd);
+            ipmiOverrides[key] = responseData ?? new byte[0];
+            this.Log(LogLevel.Debug, "IPMI override set: netFn=0x{0:X2} cmd=0x{1:X2} responseLen={2}",
+                     netFn, cmd, (responseData != null ? responseData.Length : 0));
+        }
+
+        /// <summary>
+        /// Removes an override for the given IPMI (netFn, cmd) pair.
+        /// </summary>
+        public void ClearIpmiOverride(byte netFn, byte cmd)
+        {
+            ushort key = MakeOverrideKey(netFn, cmd);
+            if (ipmiOverrides.Remove(key))
+            {
+                this.Log(LogLevel.Debug, "IPMI override cleared: netFn=0x{0:X2} cmd=0x{1:X2}", netFn, cmd);
+            }
+        }
+
+        /// <summary>
+        /// Clears all IPMI overrides.
+        /// </summary>
+        public void ClearAllIpmiOverrides()
+        {
+            ipmiOverrides.Clear();
+            this.Log(LogLevel.Debug, "All IPMI overrides cleared");
+        }
+
+        // --- Host-side IPMI Injection ---
+
+        /// <summary>
+        /// Simulates the host writing an IPMI command to a KCS channel.
+        /// Follows the KCS write protocol: CMD_DATA set + netFn to IDR,
+        /// clear CMD_DATA + cmd to IDR, data bytes to IDR, then END byte.
+        /// If an override exists, the response is immediately placed in the ODR.
+        /// </summary>
+        public void SendHostIpmiCommand(byte netFn, byte cmd, byte[] requestData, int channel = 0)
+        {
+            if (channel < 0 || channel > 3)
+            {
+                this.Log(LogLevel.Warning, "IPMI inject: invalid channel {0}", channel);
+                return;
+            }
+
+            long idrOffset = GetIDROffset(channel);
+            long odrOffset = GetODROffset(channel);
+            long strOffset = GetSTROffset(channel);
+
+            this.Log(LogLevel.Debug, "IPMI inject: ch={0} netFn=0x{1:X2} cmd=0x{2:X2} dataLen={3}",
+                     channel, netFn, cmd, (requestData != null ? requestData.Length : 0));
+
+            // KCS write protocol: set CMD_DATA bit, write netFn to IDR
+            registers[strOffset / 4] |= STR_CD;
+            WriteDoubleWord(idrOffset, netFn);
+
+            // Clear CMD_DATA, write cmd to IDR
+            registers[strOffset / 4] &= ~STR_CD;
+            WriteDoubleWord(idrOffset, cmd);
+
+            // Write each data byte to IDR
+            if (requestData != null)
+            {
+                foreach (byte b in requestData)
+                {
+                    WriteDoubleWord(idrOffset, b);
+                }
+            }
+
+            // Write END byte (0x00) with CMD_DATA set
+            registers[strOffset / 4] |= STR_CD;
+            WriteDoubleWord(idrOffset, 0x00);
+
+            // Check for override response
+            ushort key = MakeOverrideKey(netFn, cmd);
+            byte[] overrideResponse;
+            if (ipmiOverrides.TryGetValue(key, out overrideResponse))
+            {
+                this.Log(LogLevel.Debug, "IPMI override hit: netFn=0x{0:X2} cmd=0x{1:X2}, responding with {2} bytes",
+                         netFn, cmd, overrideResponse.Length);
+
+                // Write completion code 0x00 to ODR
+                WriteDoubleWord(odrOffset, 0x00);
+
+                // Write override response data bytes to ODR
+                foreach (byte b in overrideResponse)
+                {
+                    WriteDoubleWord(odrOffset, b);
+                }
+            }
+            else
+            {
+                this.Log(LogLevel.Debug, "IPMI no override for netFn=0x{0:X2} cmd=0x{1:X2}, leaving for BMC software",
+                         netFn, cmd);
+            }
+        }
+
+        // --- Birchstream Boot Overrides ---
+
+        /// <summary>
+        /// Configures default IPMI overrides for Birchstream co-simulation boot flow.
+        /// </summary>
+        public void SetupBirchstreamDefaults()
+        {
+            this.Log(LogLevel.Debug, "Setting up Birchstream boot IPMI overrides");
+
+            // Get Device ID (netFn=0x06, cmd=0x01): Birchstream BMC device ID
+            SetIpmiOverride(0x06, 0x01, new byte[] {
+                0x20,       // Device ID
+                0x01,       // Device Revision
+                0x02,       // Firmware Revision 1
+                0x03,       // Firmware Revision 2
+                0x02,       // IPMI Version (2.0)
+                0xBF,       // Additional Device Support
+                0x2A, 0xCD, 0x00, // Manufacturer ID (Aspeed)
+                0x00, 0x00  // Product ID
+            });
+
+            // Get Boot Options (netFn=0x08, cmd=0x09): boot device = eSPI SAF
+            SetIpmiOverride(0x08, 0x09, new byte[] {
+                0x01,       // Parameter version
+                0x05,       // Parameter selector (boot flags)
+                0x80,       // Parameter valid / boot flags valid
+                0x24,       // Boot device = eSPI SAF (bits 5:2 = 0b1001)
+                0x00,       // BIOS verbosity / console redirection
+                0x00        // BIOS shared mode override
+            });
+
+            // Get System Boot Options (netFn=0x00, cmd=0x08): XDMA metadata
+            SetIpmiOverride(0x00, 0x08, new byte[] {
+                (byte)(XdmaBaseAddress & 0xFF),
+                (byte)((XdmaBaseAddress >> 8) & 0xFF),
+                (byte)((XdmaBaseAddress >> 16) & 0xFF),
+                (byte)((XdmaBaseAddress >> 24) & 0xFF),
+                (byte)(XdmaTransferSize & 0xFF),
+                (byte)((XdmaTransferSize >> 8) & 0xFF),
+                (byte)((XdmaTransferSize >> 16) & 0xFF),
+                (byte)((XdmaTransferSize >> 24) & 0xFF)
+            });
+        }
+
         // --- Private helpers ---
 
         private bool IsChannelEnabled(int ch)
@@ -215,8 +374,50 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 IRQ.Set(false);
         }
 
+        private static ushort MakeOverrideKey(byte netFn, byte cmd)
+        {
+            return (ushort)((netFn << 8) | cmd);
+        }
+
+        private static long GetIDROffset(int channel)
+        {
+            switch (channel)
+            {
+                case 0: return IDR1;
+                case 1: return IDR2;
+                case 2: return IDR3;
+                case 3: return IDR4;
+                default: return IDR1;
+            }
+        }
+
+        private static long GetODROffset(int channel)
+        {
+            switch (channel)
+            {
+                case 0: return ODR1;
+                case 1: return ODR2;
+                case 2: return ODR3;
+                case 3: return ODR4;
+                default: return ODR1;
+            }
+        }
+
+        private static long GetSTROffset(int channel)
+        {
+            switch (channel)
+            {
+                case 0: return STR1;
+                case 1: return STR2;
+                case 2: return STR3;
+                case 3: return STR4;
+                default: return STR1;
+            }
+        }
+
         private uint[] registers;
         private uint subdeviceIrqsPending;
+        private readonly Dictionary<ushort, byte[]> ipmiOverrides;
 
         // Register space
         private const int RegisterSpaceSize = 0x1000;
@@ -269,5 +470,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // STR bits
         private const uint STR_OBF = (1u << 0);
         private const uint STR_IBF = (1u << 1);
+
+        // KCS protocol constants
+        private const uint STR_CD = (1u << 3);
+        private const byte KCS_WRITE_START = 0x61;
+        private const byte KCS_WRITE_END = 0x62;
     }
 }

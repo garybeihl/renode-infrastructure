@@ -992,6 +992,115 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             InjectFlashRx(0x00, tag, result);
         }
 
+        // =================================================================
+        // Reset/Power Coordination (Phase 1e)
+        // Reference: Birchstream Simics reset orchestrator
+        // =================================================================
+
+        /// <summary>
+        /// Simulate host platform reset (PLTRST# assertion).
+        /// Sets PLTRST# bit in VW SYSEVT, triggering BMC-side handler.
+        /// </summary>
+        public void AssertPlatformReset()
+        {
+            uint oldVal = sysevtValue;
+            sysevtValue &= ~SysevtPltrst;  // PLTRST# active low
+            this.Log(LogLevel.Info, "eSPI: PLTRST# asserted (host reset)");
+            NotifySysevtChange(oldVal, sysevtValue);
+        }
+
+        /// <summary>
+        /// Deassert host platform reset (PLTRST# deasserted = host running).
+        /// </summary>
+        public void DeassertPlatformReset()
+        {
+            uint oldVal = sysevtValue;
+            sysevtValue |= SysevtPltrst;  // PLTRST# deasserted = host running
+            this.Log(LogLevel.Info, "eSPI: PLTRST# deasserted (host running)");
+            NotifySysevtChange(oldVal, sysevtValue);
+        }
+
+        /// <summary>
+        /// Simulate host entering sleep state.
+        /// </summary>
+        public void SetHostSleepState(uint sleepBits)
+        {
+            uint oldVal = sysevtValue;
+            // Set sleep state bits (S3=bit0, S4=bit1, S5=bit2)
+            sysevtValue = (sysevtValue & ~(SysevtS3Sleep | SysevtS4Sleep | SysevtS5Sleep)) |
+                          (sleepBits & (SysevtS3Sleep | SysevtS4Sleep | SysevtS5Sleep));
+            this.Log(LogLevel.Debug, "eSPI: Host sleep state = 0x{0:X}", sleepBits);
+            NotifySysevtChange(oldVal, sysevtValue);
+        }
+
+        /// <summary>
+        /// Simulate host reset warning (OOB_RST_WARN).
+        /// Host asserts this before initiating a graceful reset.
+        /// </summary>
+        public void AssertHostResetWarning()
+        {
+            uint oldVal = sysevtValue;
+            sysevtValue |= SysevtHostRstWarn;
+            this.Log(LogLevel.Debug, "eSPI: HOST_RST_WARN asserted");
+            NotifySysevtChange(oldVal, sysevtValue);
+        }
+
+        /// <summary>
+        /// Perform a full cold reset sequence:
+        /// 1. Assert PLTRST#
+        /// 2. Clear host-driven SYSEVT bits
+        /// 3. Reset Flash RX/TX channels
+        /// 4. Deassert PLTRST# (host restarts)
+        /// </summary>
+        public void ColdReset()
+        {
+            this.Log(LogLevel.Info, "eSPI: Cold reset sequence starting");
+
+            // Assert PLTRST#
+            AssertPlatformReset();
+
+            // Clear host-driven SYSEVT bits (sleep, warnings)
+            uint oldVal = sysevtValue;
+            sysevtValue &= SysevtSlaveDrivenMask;
+            NotifySysevtChange(oldVal, sysevtValue);
+
+            // Reset flash channel state
+            ResetFlashRx();
+            ResetFlashTx();
+
+            // Deassert PLTRST# after reset
+            DeassertPlatformReset();
+
+            this.Log(LogLevel.Info, "eSPI: Cold reset sequence complete");
+        }
+
+        /// <summary>
+        /// Perform a warm reset sequence:
+        /// 1. Assert HOST_RST_WARN
+        /// 2. Assert PLTRST#
+        /// 3. Keep persistent state (flash contents)
+        /// 4. Deassert PLTRST#
+        /// </summary>
+        public void WarmReset()
+        {
+            this.Log(LogLevel.Info, "eSPI: Warm reset sequence starting");
+
+            AssertHostResetWarning();
+            AssertPlatformReset();
+
+            // Warm reset preserves flash/DRAM contents, only resets transient state
+            // (Flash channel FIFOs are NOT reset on warm reset)
+
+            DeassertPlatformReset();
+
+            // Clear reset warning
+            uint oldVal = sysevtValue;
+            sysevtValue &= ~SysevtHostRstWarn;
+            NotifySysevtChange(oldVal, sysevtValue);
+
+            this.Log(LogLevel.Info, "eSPI: Warm reset sequence complete");
+        }
+
         // SAF partition constants (from Birchstream Simics oracle)
         // Host address 0x00000000 - 0x00FFFFFF -> FMC flash @ BMC 0x20000000
         // Host address 0x01000000 - 0x2FFFFFFF -> DRAM @ BMC 0x82000000
@@ -1002,7 +1111,137 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private const uint SafBmcDramBase   = 0x82000000;  // BMC DRAM for OS region
         private const uint SafMaxBurstSize  = 64;          // eSPI spec max
 
+        // =================================================================
+        // SAF Boot Header Parsing (96 bytes at OS region offset 0)
+        // Reference: Birchstream Simics espi_saf_orchestrator
+        // =================================================================
+
+        /// <summary>
+        /// Validate the SAF boot header at the start of the OS region.
+        /// Returns true if the header is valid (correct magic, non-zero size, CRC match).
+        /// </summary>
+        public bool ValidateSafBootHeader(out uint imageSize, out uint entryPoint, out uint flags)
+        {
+            imageSize = 0;
+            entryPoint = 0;
+            flags = 0;
+
+            var sysbus = machine.GetSystemBus(this);
+
+            // Read 96-byte header from OS region (DRAM @ SafBmcDramBase)
+            byte[] header;
+            try
+            {
+                header = sysbus.ReadBytes(SafBmcDramBase, SafBootHeaderSize);
+            }
+            catch(Exception e)
+            {
+                this.Log(LogLevel.Error, "SAF: Failed to read boot header at 0x{0:X8}: {1}", SafBmcDramBase, e.Message);
+                return false;
+            }
+
+            // Check magic: "SAFB" = 0x53414642
+            uint magic = BitConverter.ToUInt32(header, 0);
+            if(magic != SafBootMagic)
+            {
+                this.Log(LogLevel.Warning, "SAF: Bad boot header magic 0x{0:X8} (expected 0x{1:X8})", magic, SafBootMagic);
+                return false;
+            }
+
+            uint version = BitConverter.ToUInt32(header, 4);
+            imageSize = BitConverter.ToUInt32(header, 8);
+            entryPoint = BitConverter.ToUInt32(header, 12);
+            uint headerCrc = BitConverter.ToUInt32(header, 16);
+            flags = BitConverter.ToUInt32(header, 20);
+
+            if(imageSize == 0)
+            {
+                this.Log(LogLevel.Warning, "SAF: Boot header has zero image size");
+                return false;
+            }
+
+            // Validate CRC over image data (starting at header offset 0x60)
+            uint dataOffset = SafBootDataOffset;
+            uint dataLen = Math.Min(imageSize, 16 * 1024 * 1024); // cap at 16MB for validation
+            byte[] imageData;
+            try
+            {
+                imageData = sysbus.ReadBytes(SafBmcDramBase + dataOffset, (int)dataLen);
+            }
+            catch(Exception e)
+            {
+                this.Log(LogLevel.Error, "SAF: Failed to read image data for CRC: {0}", e.Message);
+                return false;
+            }
+
+            uint computedCrc = ComputeCrc32(imageData, 0, imageData.Length);
+            if(computedCrc != headerCrc)
+            {
+                this.Log(LogLevel.Warning, "SAF: CRC mismatch (header=0x{0:X8} computed=0x{1:X8})", headerCrc, computedCrc);
+                return false;
+            }
+
+            this.Log(LogLevel.Info, "SAF: Valid boot header: size=0x{0:X} entry=0x{1:X8} flags=0x{2:X}", imageSize, entryPoint, flags);
+            return true;
+        }
+
+        /// <summary>
+        /// Write a SAF boot header to the OS region in DRAM.
+        /// Used by BMC to prepare an image for host consumption.
+        /// </summary>
+        public void WriteSafBootHeader(uint imageSize, uint entryPoint, uint flags, byte[] imageData)
+        {
+            var sysbus = machine.GetSystemBus(this);
+
+            // Write image data first (at header offset 0x60)
+            if(imageData != null && imageData.Length > 0)
+            {
+                sysbus.WriteBytes(imageData, SafBmcDramBase + SafBootDataOffset);
+            }
+
+            // Compute CRC over image data
+            uint crc = (imageData != null) ? ComputeCrc32(imageData, 0, imageData.Length) : 0;
+
+            // Build 96-byte header
+            byte[] header = new byte[SafBootHeaderSize];
+            BitConverter.GetBytes(SafBootMagic).CopyTo(header, 0);       // Magic
+            BitConverter.GetBytes((uint)1).CopyTo(header, 4);            // Version
+            BitConverter.GetBytes(imageSize).CopyTo(header, 8);          // Image size
+            BitConverter.GetBytes(entryPoint).CopyTo(header, 12);        // Entry point
+            BitConverter.GetBytes(crc).CopyTo(header, 16);               // CRC-32
+            BitConverter.GetBytes(flags).CopyTo(header, 20);             // Flags
+            // bytes 24-63: UUID + reserved (already zeroed)
+
+            sysbus.WriteBytes(header, SafBmcDramBase);
+
+            this.Log(LogLevel.Debug, "SAF: Boot header written: size=0x{0:X} entry=0x{1:X8} crc=0x{2:X8}", imageSize, entryPoint, crc);
+        }
+
+        private static uint ComputeCrc32(byte[] data, int start, int length)
+        {
+            uint crc = 0xFFFFFFFF;
+            for(int i = start; i < start + length && i < data.Length; i++)
+            {
+                crc ^= data[i];
+                for(int j = 0; j < 8; j++)
+                {
+                    if((crc & 1) != 0)
+                        crc = (crc >> 1) ^ 0xEDB88320;
+                    else
+                        crc >>= 1;
+                }
+            }
+            return crc ^ 0xFFFFFFFF;
+        }
+
+        // SAF boot header constants
+        private const uint SafBootMagic      = 0x53414642;  // "SAFB"
+        private const int  SafBootHeaderSize = 96;
+        private const uint SafBootDataOffset = 0x60;        // Image data starts after header
+
         private uint[] mmbiHostRwp = new uint[MmbiMaxInst];
     }
 }
+
+
 
