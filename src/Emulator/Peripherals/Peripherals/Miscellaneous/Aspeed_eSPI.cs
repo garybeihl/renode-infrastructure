@@ -912,6 +912,97 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private uint genCapValue, ch0CapValue, ch1CapValue;
         private uint ch2CapValue, ch3CapValue, ch3Cap2Value;
         private uint mmbiCtrlValue, mmbiIntStsValue, mmbiIntEnValue;
+
+        // =================================================================
+        // eSPI SAF (Slave Attached Flash) Partition Routing
+        // Reference: Birchstream Simics oracle
+        // =================================================================
+
+        /// <summary>
+        /// Handle a SAF (Slave Attached Flash) read request from the host.
+        /// Routes the request through the SAF partition map and delivers
+        /// data via the normal Flash RX channel path.
+        /// </summary>
+        /// <param name="hostAddress">Host physical address to read from</param>
+        /// <param name="length">Number of bytes to read (max 64 per eSPI spec)</param>
+        /// <param name="tag">eSPI transaction tag (0-15)</param>
+        public void HandleSafRead(uint hostAddress, uint length, byte tag = 0)
+        {
+            if(length == 0 || length > SafMaxBurstSize)
+            {
+                this.Log(LogLevel.Warning, "SAF: Invalid read length {0} (max {1})", length, SafMaxBurstSize);
+                return;
+            }
+
+            var sysbus = machine.GetSystemBus(this);
+            byte[] result = new byte[length];
+            uint filled = 0;
+
+            while(filled < length)
+            {
+                uint hostOff = hostAddress + filled;
+                uint remaining = length - filled;
+                uint bmcAddr;
+                uint regionRemaining;
+
+                if(hostOff < SafBiosRegionEnd)
+                {
+                    // BIOS region -> FMC flash window
+                    bmcAddr = SafBmcFlashBase + hostOff;
+                    regionRemaining = SafBiosRegionEnd - hostOff;
+                }
+                else if(hostOff < SafOsRegionEnd)
+                {
+                    // OS region -> BMC DRAM
+                    bmcAddr = SafBmcDramBase + (hostOff - SafBiosRegionEnd);
+                    regionRemaining = SafOsRegionEnd - hostOff;
+                }
+                else
+                {
+                    // Hole / unmapped -> 0xFF fill
+                    uint fillLen = remaining;
+                    for(uint i = 0; i < fillLen; i++)
+                        result[filled + i] = 0xFF;
+                    filled += fillLen;
+                    continue;
+                }
+
+                uint chunkLen = Math.Min(remaining, regionRemaining);
+
+                try
+                {
+                    var data = sysbus.ReadBytes(bmcAddr, (int)chunkLen);
+                    Array.Copy(data, 0, result, (int)filled, (int)chunkLen);
+                }
+                catch(Exception e)
+                {
+                    this.Log(LogLevel.Error, "SAF: Read failed at BMC addr 0x{0:X8}: {1}", bmcAddr, e.Message);
+                    // Fill with 0xFF on error
+                    for(uint i = 0; i < chunkLen; i++)
+                        result[filled + i] = 0xFF;
+                }
+
+                filled += chunkLen;
+            }
+
+            this.Log(LogLevel.Debug, "SAF: Read host=0x{0:X8} len={1} -> delivered via Flash RX", hostAddress, length);
+
+            // Deliver through normal Flash RX path
+            // Cycle type 0x00 = successful completion with data
+            InjectFlashRx(0x00, tag, result);
+        }
+
+        // SAF partition constants (from Birchstream Simics oracle)
+        // Host address 0x00000000 - 0x00FFFFFF -> FMC flash @ BMC 0x20000000
+        // Host address 0x01000000 - 0x2FFFFFFF -> DRAM @ BMC 0x82000000
+        // Host address 0x30000000+              -> 0xFF hole
+        private const uint SafBiosRegionEnd = 0x01000000;  // 16 MB
+        private const uint SafOsRegionEnd   = 0x30000000;  // 768 MB total window
+        private const uint SafBmcFlashBase  = 0x20000000;  // FMC flash window
+        private const uint SafBmcDramBase   = 0x82000000;  // BMC DRAM for OS region
+        private const uint SafMaxBurstSize  = 64;          // eSPI spec max
+
         private uint[] mmbiHostRwp = new uint[MmbiMaxInst];
     }
 }
+
