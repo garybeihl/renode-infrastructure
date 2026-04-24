@@ -1101,6 +1101,112 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             this.Log(LogLevel.Info, "eSPI: Warm reset sequence complete");
         }
 
+        // ===== GPIO Power Signal Modeling =====
+        // Birchstream power/error signals managed by eSPI controller.
+        // BMC outputs: CPUPWRGD (GPIO V[4]), PSPWROK (GPIO G[4])
+        // Host inputs to BMC: CATERR (GPIO H[5]), ERR0 (GPIO D[0]), ERR1 (GPIO D[1]), ERR2 (GPIO D[2])
+
+        /// <summary>
+        /// Assert CPUPWRGD — BMC indicates CPU power is good.
+        /// Corresponds to GPIO group V, bit 4.
+        /// </summary>
+        public void AssertCpuPowerGood()
+        {
+            cpuPowerGood = true;
+            this.Log(LogLevel.Info, "eSPI: CPUPWRGD asserted (CPU power good)");
+        }
+
+        /// <summary>
+        /// Deassert CPUPWRGD — CPU power not good.
+        /// </summary>
+        public void DeassertCpuPowerGood()
+        {
+            cpuPowerGood = false;
+            this.Log(LogLevel.Info, "eSPI: CPUPWRGD deasserted");
+        }
+
+        /// <summary>
+        /// Assert PSPWROK — BMC indicates platform power supply OK.
+        /// Corresponds to GPIO group G, bit 4.
+        /// </summary>
+        public void AssertPsPowerOk()
+        {
+            psPowerOk = true;
+            this.Log(LogLevel.Info, "eSPI: PSPWROK asserted (power supply OK)");
+        }
+
+        /// <summary>
+        /// Deassert PSPWROK — platform power supply not OK.
+        /// </summary>
+        public void DeassertPsPowerOk()
+        {
+            psPowerOk = false;
+            this.Log(LogLevel.Info, "eSPI: PSPWROK deasserted");
+        }
+
+        /// <summary>
+        /// Inject CATERR from host — catastrophic error signal.
+        /// Corresponds to GPIO group H, bit 5.
+        /// </summary>
+        public void InjectCatErr()
+        {
+            catErr = true;
+            this.Log(LogLevel.Warning, "eSPI: CATERR injected (catastrophic host error)");
+        }
+
+        /// <summary>
+        /// Clear CATERR.
+        /// </summary>
+        public void ClearCatErr()
+        {
+            catErr = false;
+            this.Log(LogLevel.Info, "eSPI: CATERR cleared");
+        }
+
+        /// <summary>
+        /// Inject host error signal (ERR0-ERR2).
+        /// errorBits: bit 0 = ERR0, bit 1 = ERR1, bit 2 = ERR2.
+        /// </summary>
+        public void InjectHostError(uint errorBits)
+        {
+            hostErrorBits = errorBits & 0x7;
+            this.Log(LogLevel.Warning, "eSPI: Host error injected: ERR0={0} ERR1={1} ERR2={2}",
+                (errorBits & 1) != 0 ? 1 : 0,
+                (errorBits & 2) != 0 ? 1 : 0,
+                (errorBits & 4) != 0 ? 1 : 0);
+        }
+
+        /// <summary>
+        /// Clear all host error signals.
+        /// </summary>
+        public void ClearHostError()
+        {
+            hostErrorBits = 0;
+            this.Log(LogLevel.Info, "eSPI: Host errors cleared");
+        }
+
+        /// <summary>
+        /// Get current power signal state (monitor-readable).
+        /// Returns: [CPUPWRGD, PSPWROK, CATERR, ERR0, ERR1, ERR2] as a bitmask.
+        /// Bit 0: CPUPWRGD, Bit 1: PSPWROK, Bit 2: CATERR,
+        /// Bit 3: ERR0, Bit 4: ERR1, Bit 5: ERR2
+        /// </summary>
+        public uint GetPowerSignalState()
+        {
+            uint state = 0;
+            if(cpuPowerGood) state |= 0x01;
+            if(psPowerOk)    state |= 0x02;
+            if(catErr)       state |= 0x04;
+            state |= (hostErrorBits << 3);
+            return state;
+        }
+
+        // Power signal state
+        private bool cpuPowerGood;
+        private bool psPowerOk;
+        private bool catErr;
+        private uint hostErrorBits;
+
         // SAF partition constants (from Birchstream Simics oracle)
         // Host address 0x00000000 - 0x00FFFFFF -> FMC flash @ BMC 0x20000000
         // Host address 0x01000000 - 0x2FFFFFFF -> DRAM @ BMC 0x82000000
