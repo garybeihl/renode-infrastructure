@@ -125,7 +125,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
 
             uint totalSize = ReadHeaderField(HDR_TOTAL_SIZE);
-            uint crc = ComputeCrc32(memory, HeaderSize, (int)Math.Min(totalSize, WindowSize - HeaderSize));
+            uint crc = ComputeCrc32(memory, (int)HeaderSize, (int)Math.Min(totalSize, (uint)(WindowSize - (int)HeaderSize)));
             WriteHeaderField(HDR_CRC32, crc);
 
             state = BootWindowState.Ready;
