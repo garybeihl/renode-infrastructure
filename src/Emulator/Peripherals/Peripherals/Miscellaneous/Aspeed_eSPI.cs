@@ -1207,6 +1207,204 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private bool catErr;
         private uint hostErrorBits;
 
+        // ===== ACPI Power State Machine =====
+        // Full S0/S3/S4/S5 state transitions matching Birchstream Simics oracle.
+        // State transitions drive PLTRST#, sleep bits, and power signals.
+
+        /// <summary>
+        /// Current ACPI power state.
+        /// </summary>
+        public enum AcpiState
+        {
+            S0_Working = 0,
+            S3_SuspendToRam = 3,
+            S4_SuspendToDisk = 4,
+            S5_SoftOff = 5,
+            G3_MechanicalOff = 6
+        }
+
+        /// <summary>
+        /// Get current ACPI state as an integer.
+        /// </summary>
+        public int GetAcpiState()
+        {
+            return (int)currentAcpiState;
+        }
+
+        /// <summary>
+        /// Transition to a new ACPI state. Validates transition legality.
+        /// Valid transitions:
+        ///   G3 -> S5 (power button), S5 -> S0 (boot), S0 -> S3/S4/S5 (sleep/shutdown)
+        ///   S3 -> S0 (resume), S4 -> S0 (resume), S5 -> S0 (power on)
+        ///   Any -> G3 (mechanical off / PSU failure)
+        /// </summary>
+        public bool TransitionAcpiState(int targetStateInt)
+        {
+            var target = (AcpiState)targetStateInt;
+            var current = currentAcpiState;
+
+            if(!IsValidTransition(current, target))
+            {
+                this.Log(LogLevel.Warning, "eSPI: Invalid ACPI transition {0} -> {1}", current, target);
+                return false;
+            }
+
+            // Exit actions for current state
+            ExitState(current);
+
+            // Entry actions for target state
+            EnterState(target);
+
+            var prev = currentAcpiState;
+            currentAcpiState = target;
+            this.Log(LogLevel.Info, "eSPI: ACPI state transition {0} -> {1}", prev, target);
+            return true;
+        }
+
+        /// <summary>
+        /// Power on sequence: G3 -> S5 -> S0.
+        /// Asserts PSPWROK, CPUPWRGD, deasserts PLTRST#.
+        /// </summary>
+        public void PowerOn()
+        {
+            if(currentAcpiState == AcpiState.G3_MechanicalOff)
+            {
+                TransitionAcpiState((int)AcpiState.S5_SoftOff);
+            }
+            if(currentAcpiState == AcpiState.S5_SoftOff)
+            {
+                TransitionAcpiState((int)AcpiState.S0_Working);
+            }
+        }
+
+        /// <summary>
+        /// Graceful shutdown: S0 -> S5.
+        /// </summary>
+        public void GracefulShutdown()
+        {
+            TransitionAcpiState((int)AcpiState.S5_SoftOff);
+        }
+
+        /// <summary>
+        /// Suspend to RAM: S0 -> S3.
+        /// </summary>
+        public void SuspendToRam()
+        {
+            TransitionAcpiState((int)AcpiState.S3_SuspendToRam);
+        }
+
+        /// <summary>
+        /// Resume from suspend: S3/S4 -> S0.
+        /// </summary>
+        public void Resume()
+        {
+            if(currentAcpiState == AcpiState.S3_SuspendToRam ||
+               currentAcpiState == AcpiState.S4_SuspendToDisk)
+            {
+                TransitionAcpiState((int)AcpiState.S0_Working);
+            }
+        }
+
+        /// <summary>
+        /// Mechanical power off: any -> G3.
+        /// </summary>
+        public void MechanicalOff()
+        {
+            TransitionAcpiState((int)AcpiState.G3_MechanicalOff);
+        }
+
+        /// <summary>
+        /// WDT-triggered reset. Performs cold reset and returns to S0.
+        /// wdtIndex: 0-3 for WDT1-WDT4.
+        /// </summary>
+        public void WatchdogReset(int wdtIndex)
+        {
+            this.Log(LogLevel.Warning, "eSPI: WDT{0} triggered system reset", wdtIndex + 1);
+            lastResetSource = (uint)(0x10 + wdtIndex); // 0x10-0x13 = WDT1-4
+            ColdReset();
+        }
+
+        /// <summary>
+        /// Get the source of the last reset (for diagnostics).
+        /// 0=none, 1=cold, 2=warm, 0x10-0x13=WDT1-4.
+        /// </summary>
+        public uint GetLastResetSource()
+        {
+            return lastResetSource;
+        }
+
+        private bool IsValidTransition(AcpiState from, AcpiState to)
+        {
+            if(to == AcpiState.G3_MechanicalOff) return true; // always allowed
+            switch(from)
+            {
+                case AcpiState.G3_MechanicalOff:
+                    return to == AcpiState.S5_SoftOff;
+                case AcpiState.S5_SoftOff:
+                    return to == AcpiState.S0_Working;
+                case AcpiState.S0_Working:
+                    return to == AcpiState.S3_SuspendToRam ||
+                           to == AcpiState.S4_SuspendToDisk ||
+                           to == AcpiState.S5_SoftOff;
+                case AcpiState.S3_SuspendToRam:
+                case AcpiState.S4_SuspendToDisk:
+                    return to == AcpiState.S0_Working;
+                default:
+                    return false;
+            }
+        }
+
+        private void ExitState(AcpiState state)
+        {
+            switch(state)
+            {
+                case AcpiState.S0_Working:
+                    AssertPlatformReset();
+                    break;
+                case AcpiState.S3_SuspendToRam:
+                case AcpiState.S4_SuspendToDisk:
+                    // Clear sleep bits on exit
+                    SetHostSleepState(0);
+                    break;
+            }
+        }
+
+        private void EnterState(AcpiState state)
+        {
+            switch(state)
+            {
+                case AcpiState.S0_Working:
+                    AssertPsPowerOk();
+                    AssertCpuPowerGood();
+                    DeassertPlatformReset();
+                    SetHostSleepState(0);
+                    break;
+                case AcpiState.S3_SuspendToRam:
+                    SetHostSleepState(1); // S3 = bit 0
+                    DeassertCpuPowerGood();
+                    break;
+                case AcpiState.S4_SuspendToDisk:
+                    SetHostSleepState(2); // S4 = bit 1
+                    DeassertCpuPowerGood();
+                    break;
+                case AcpiState.S5_SoftOff:
+                    SetHostSleepState(4); // S5 = bit 2
+                    DeassertCpuPowerGood();
+                    break;
+                case AcpiState.G3_MechanicalOff:
+                    AssertPlatformReset();
+                    DeassertCpuPowerGood();
+                    DeassertPsPowerOk();
+                    SetHostSleepState(0);
+                    ClearCatErr();
+                    ClearHostError();
+                    break;
+            }
+        }
+
+        private AcpiState currentAcpiState = AcpiState.S0_Working;
+        private uint lastResetSource;
+
         // SAF partition constants (from Birchstream Simics oracle)
         // Host address 0x00000000 - 0x00FFFFFF -> FMC flash @ BMC 0x20000000
         // Host address 0x01000000 - 0x2FFFFFFF -> DRAM @ BMC 0x82000000
