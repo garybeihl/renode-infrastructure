@@ -172,6 +172,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         /// When a host IPMI command matching this pair is injected, the override
         /// response is immediately written to the ODR with completion code 0x00.
         /// </summary>
+        /// <summary>
+        /// Configures an auto-response with empty response data.
+        /// </summary>
+        public void SetIpmiOverride(byte netFn, byte cmd)
+        {
+            SetIpmiOverride(netFn, cmd, new byte[0]);
+        }
+
         public void SetIpmiOverride(byte netFn, byte cmd, byte[] responseData)
         {
             ushort key = MakeOverrideKey(netFn, cmd);
@@ -209,6 +217,22 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         /// clear CMD_DATA + cmd to IDR, data bytes to IDR, then END byte.
         /// If an override exists, the response is immediately placed in the ODR.
         /// </summary>
+        /// <summary>
+        /// Simulates a host IPMI command with no request data on channel 0.
+        /// </summary>
+        public void SendHostIpmiCommand(byte netFn, byte cmd)
+        {
+            SendHostIpmiCommand(netFn, cmd, null, 0);
+        }
+
+        /// <summary>
+        /// Simulates a host IPMI command with no request data on specified channel.
+        /// </summary>
+        public void SendHostIpmiCommand(byte netFn, byte cmd, int channel)
+        {
+            SendHostIpmiCommand(netFn, cmd, null, channel);
+        }
+
         public void SendHostIpmiCommand(byte netFn, byte cmd, byte[] requestData, int channel = 0)
         {
             if (channel < 0 || channel > 3)
