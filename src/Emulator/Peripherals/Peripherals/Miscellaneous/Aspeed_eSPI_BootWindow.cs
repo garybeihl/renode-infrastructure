@@ -153,6 +153,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 this.Log(LogLevel.Debug, "BootWindow: -> EMPTY (reset)");
                 IRQ.Unset();
             }
+            else if(newState > state && newState <= BootWindowState.Consumed)
+            {
+                // Allow forward transitions via direct write
+                var prev = state;
+                state = newState;
+                this.Log(LogLevel.Debug, "BootWindow: {0} -> {1} (direct write)", prev, newState);
+            }
             else
             {
                 this.Log(LogLevel.Warning, "BootWindow: Invalid transition {0} -> {1}", state, newState);

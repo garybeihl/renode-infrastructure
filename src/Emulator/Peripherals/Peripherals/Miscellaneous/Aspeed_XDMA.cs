@@ -111,7 +111,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
             while(rdp != wrp && processed < MaxDescriptors)
             {
-                uint descAddr = queueBase + rdp * DescriptorSize;
+                uint maxEntries = (queueEnd > 0) ? queueEnd / DescriptorSize : 1;
+                uint descAddr = queueBase + (maxEntries > 0 ? (rdp % maxEntries) : rdp) * DescriptorSize;
 
                 // Read 16-byte descriptor: src, dst, length, flags
                 uint srcAddr, dstAddr, xferLen, flags;
@@ -132,8 +133,10 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 if(xferLen == 0)
                 {
                     this.Log(LogLevel.Warning, "XDMA: Zero-length descriptor at 0x{0:X8}", descAddr);
-                    error = true;
-                    break;
+                    // Zero-length: skip silently
+                    processed++;
+                    rdp++;
+                    continue;
                 }
 
                 if((xferLen & 0x7) != 0)
@@ -180,11 +183,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
                 processed++;
 
-                // Advance read pointer with wrap
+                // Advance read pointer (linear counter like WRP)
                 rdp++;
-                uint maxEntries = queueEnd / DescriptorSize;
-                if(maxEntries > 0 && rdp >= maxEntries)
-                    rdp = 0;
             }
 
             storage[R_BMC_CMDQ_RDP] = rdp;

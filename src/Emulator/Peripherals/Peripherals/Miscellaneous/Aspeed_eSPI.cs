@@ -128,6 +128,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             sysevtIntStsValue = 0;
             sysevt1IntEnValue = 0;
             sysevt1IntStsValue = 0;
+            // Initialize power signals to match S0_Working initial state
+            cpuPowerGood = true;
+            psPowerOk = true;
+            catErr = false;
+            hostErrorBits = 0;
+            currentAcpiState = AcpiState.S0_Working;
+            lastResetSource = 0;
             intEnValue = 0;
             ctrlValue = 0;
             mmbiCtrlValue = 0;
@@ -1232,6 +1239,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         /// <summary>
+        /// Get current ACPI state as a human-readable string.
+        /// </summary>
+        public string GetAcpiStateName()
+        {
+            return currentAcpiState.ToString();
+        }
+
+        /// <summary>
         /// Transition to a new ACPI state. Validates transition legality.
         /// Valid transitions:
         ///   G3 -> S5 (power button), S5 -> S0 (boot), S0 -> S3/S4/S5 (sleep/shutdown)
@@ -1421,6 +1436,38 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // =================================================================
 
         /// <summary>
+/// <summary>
+        /// Parameterless overload for Renode command interface.
+        /// Validates magic and non-zero image size (skips CRC).
+        /// </summary>
+        public bool ValidateSafBootHeader()
+        {
+            var sysbus = machine.GetSystemBus(this);
+            byte[] header;
+            try
+            {
+                header = sysbus.ReadBytes(SafBmcDramBase, SafBootHeaderSize);
+            }
+            catch(Exception e)
+            {
+                this.Log(LogLevel.Error, "SAF: Failed to read boot header at 0x{0:X8}: {1}", SafBmcDramBase, e.Message);
+                return false;
+            }
+            uint magic = BitConverter.ToUInt32(header, 0);
+            if(magic != SafBootMagic)
+            {
+                this.Log(LogLevel.Warning, "SAF: Bad boot header magic 0x{0:X8} (expected 0x{1:X8})", magic, SafBootMagic);
+                return false;
+            }
+            uint imageSize = BitConverter.ToUInt32(header, 8);
+            if(imageSize == 0)
+            {
+                this.Log(LogLevel.Warning, "SAF: Boot header has zero image size");
+                return false;
+            }
+            return true;
+        }
+
         /// Validate the SAF boot header at the start of the OS region.
         /// Returns true if the header is valid (correct magic, non-zero size, CRC match).
         /// </summary>
@@ -1490,6 +1537,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         }
 
         /// <summary>
+        /// WriteSafBootHeader overload with no image data.
+        /// </summary>
+        public void WriteSafBootHeader(uint imageSize, uint entryPoint, uint flags)
+        {
+            WriteSafBootHeader(imageSize, entryPoint, flags, new byte[0]);
+        }
+
+        /// <summary>
+        /// WriteSafBootHeader overload accepting hex data as a string (e.g., "DEADBEEF").
+        /// </summary>
+        public void WriteSafBootHeader(uint imageSize, uint entryPoint, uint flags, string hexData)
+        {
+            byte[] data = string.IsNullOrEmpty(hexData) ? new byte[0] : HexStringToBytes(hexData);
+            WriteSafBootHeader(imageSize, entryPoint, flags, data);
+        }
+
+        /// <summary>
         /// Write a SAF boot header to the OS region in DRAM.
         /// Used by BMC to prepare an image for host consumption.
         /// </summary>
@@ -1519,6 +1583,15 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             sysbus.WriteBytes(header, SafBmcDramBase);
 
             this.Log(LogLevel.Debug, "SAF: Boot header written: size=0x{0:X} entry=0x{1:X8} crc=0x{2:X8}", imageSize, entryPoint, crc);
+        }
+
+        private static byte[] HexStringToBytes(string hex)
+        {
+            hex = hex.Replace(" ", "").Replace("0x", "").Replace(",", "");
+            byte[] bytes = new byte[hex.Length / 2];
+            for(int i = 0; i < bytes.Length; i++)
+                bytes[i] = Convert.ToByte(hex.Substring(i * 2, 2), 16);
+            return bytes;
         }
 
         private static uint ComputeCrc32(byte[] data, int start, int length)
