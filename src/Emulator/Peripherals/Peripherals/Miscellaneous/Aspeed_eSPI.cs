@@ -199,6 +199,27 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             UpdateIrq();
         }
 
+
+
+        /// <summary>
+        /// Connect an OOB MCTP handler. When BMC sends OOB TX, the handler
+        /// receives the raw packet bytes.
+        /// </summary>
+        public void ConnectOobHandler(Action<byte[]> handler)
+        {
+            oobMctpHandler = handler;
+            this.Log(LogLevel.Info, "eSPI: connected OOB MCTP handler");
+        }
+
+        /// <summary>
+        /// Inject an MCTP packet into OOB RX (external device → BMC).
+        /// </summary>
+        public void InjectOobMctp(byte[] mctpPacket)
+        {
+            InjectOobRx(0x21, 0x00, mctpPacket);
+            this.Log(LogLevel.Debug, "eSPI: MCTP OOB inject {0} bytes", mctpPacket.Length);
+        }
+
         /// <summary>
         /// Inject a Flash channel RX packet (host → BMC).
         /// </summary>
@@ -692,6 +713,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         private void CompleteOobTx()
         {
+            if(oobMctpHandler != null && oobTxLen > 0)
+            {
+                var pkt = new byte[oobTxLen];
+                Array.Copy(oobTxBuf, 0, pkt, 0, oobTxLen);
+                this.Log(LogLevel.Debug, "eSPI OOB TX -> PLDM: {0} bytes", oobTxLen);
+                oobMctpHandler(pkt);
+            }
             oobTxCtrlValue &= ~TrigPend;
             oobTxLen = 0;
             intStsValue |= IntOobTxCmplt;
@@ -893,6 +921,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // FIFO buffers
         private readonly byte[] pcRxBuf, pcTxBuf, npTxBuf;
         private readonly byte[] oobRxBuf, oobTxBuf;
+        private Action<byte[]> oobMctpHandler;
         private readonly byte[] flashRxBuf, flashTxBuf;
 
         // FIFO positions/lengths
